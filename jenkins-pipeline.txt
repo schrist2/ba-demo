@@ -1,0 +1,117 @@
+node {
+    // Setup TerraForm home directory
+    def tf_home = tool name: "terraform", type: "org.jenkinsci.plugins.terraform.TerraformInstallation"
+    env.PATH = "${tf_home}:${env.PATH}"
+    
+    def exitcode = 0
+    def tf_apply_plan = false
+	def status_code = 0
+
+    stage("Init") {
+        git "/var/jenkins_home/project/src/.git"
+		sh 'git submodule update --init --recursive'
+        
+        withCredentials([
+            file(credentialsId: "private_key", variable: "private_key"),
+            file(credentialsId: "public_key", variable: "public_key"),
+            file(credentialsId: "aws_access_key_test", variable: "aws_access_key"),
+            file(credentialsId: "aws_secret_key_test", variable: "aws_secret_key")
+        ]) {
+            sh "cp -f \$private_key ./auth/private_key"
+            sh "cp -f \$public_key ./auth/public_key"
+            sh "cp -f \$aws_access_key ./auth/aws_access_key"
+            sh "cp -f \$aws_secret_key ./auth/aws_secret_key"
+        }
+        
+        sh "terraform init -input=false"
+        sh "terraform refresh"
+    }
+    stage("Testing (Pre-Apply)") {
+        sh "set +e; terraform validate; echo \$? > exitcode"
+        exitcode = readFile("exitcode").trim()
+        
+        // Some validation errors occured.
+        if (exitcode != "0") {
+            currentBuild.result = "FAILURE"
+        }
+    }
+    stage("Deployment (Plan)") {
+        sh "set +e; terraform plan -out=tf_plan -input=false -detailed-exitcode; echo \$? > exitcode"
+        exitcode = readFile("exitcode").trim()
+        
+        // Plan will not change anything
+        if (exitcode == "0") {
+
+        }
+        
+        // Could not execute 'terraform plan'
+        if (exitcode == "1") {
+            currentBuild.result = "FAILURE"
+        }
+        
+        // Plan will change something, wait for approval
+        if (exitcode == "2") {
+            stash name: "tf_plan", includes: "tf_plan"
+            echo "Plan needs to be approved: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            try {
+                // Maybe save "terraform plan" output and attach it to a mail?
+                //input message: "Apply Plan?", ok: "Yes"
+                tf_apply_plan = true
+            } catch (err) {
+                echo "Plan discarded: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+                tf_apply_plan = false
+                currentBuild.result = "FAILURE"
+            }
+        }
+    }
+    if (tf_apply_plan) {
+        stage("Deployment (Apply)") {
+            unstash "tf_plan"
+            sh "set +e; terraform apply tf_plan; echo \$? > exitcode"
+            exitcode = readFile("exitcode").trim()
+    
+            if (exitcode == "0") {
+                echo "Plan applied ${env.JOB_NAME} - ${env.BUILD_NUMBER}"    
+            } else {
+                echo "Plan could not be applied: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+                currentBuild.result = "FAILURE"
+            }
+        }
+        stage("Testing (Post-Apply)") {
+            sh "terraform output web_public_dns > output"
+            def web_public_dns = readFile("output").trim()
+            
+            sh "(curl -i ${web_public_dns} | grep -oP '(?<=^HTTP/1.1 )\\S+') > output"
+            status_code = readFile("output").trim()
+			
+			echo "HTTP status code: ${status_code}"
+            
+            if (status_code != "200") {
+                currentBuild.result = "FAILURE"
+            }
+        }
+		if (status_code == "200") {
+		    stage("Deployment (Live)") {
+				withCredentials([
+					file(credentialsId: "aws_access_key_prod", variable: "aws_access_key"),
+					file(credentialsId: "aws_secret_key_prod", variable: "aws_secret_key")
+				]) {
+					sh "cp -f \$aws_access_key ./auth/aws_access_key"
+					sh "cp -f \$aws_secret_key ./auth/aws_secret_key"
+				}
+				
+				sh "terraform init -input=false"
+				sh "terraform refresh"
+				sh "terraform apply -input=false"
+				
+				// Share updated state file with git source repository.
+				sh "cp -f terraform.tfstate /var/jenkins_home/project/src/terraform.tfstate"
+				dir("/var/jenkins_home/project/src") {
+					sh 'git config --global user.email "jenkins@jenkins.com"'
+					sh 'git config --global user.name "Jenkins"'
+					sh 'git commit -m "TerraForm state update (Jenkins)." terraform.tfstate'
+				}
+			}
+		}
+    }
+}
